@@ -1,0 +1,13 @@
+{
+  "name": "Arya Color",
+  "short_name": "Arya Color",
+  "description": "A cheerful, family-first color-by-number game made for Arya.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#fff8f1",
+  "theme_color": "#ff7f9f"
+}
+
