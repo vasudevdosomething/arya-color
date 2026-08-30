@@ -8,6 +8,7 @@ import {
 } from 'react'
 import type { Artwork } from '../game/artwork'
 import { canFillCell, findHintCell, getColorProgress } from '../game/rules'
+import type { ArtworkProgressSnapshot } from '../storage/progress'
 import {
   cellsOnLine,
   clamp,
@@ -28,6 +29,7 @@ export type FillSource = 'paint' | 'hint'
 
 export interface ColorCanvasHandle {
   fillHint: () => boolean
+  getProgress: () => ArtworkProgressSnapshot
   isComplete: () => boolean
   replayCompletion: () => Promise<void>
 }
@@ -39,8 +41,10 @@ interface ColorCanvasProps {
   resetProgressNonce: number
   interactionLocked: boolean
   cleanReveal: boolean
+  initialProgress: ArtworkProgressSnapshot
   onStatsChange: (stats: CanvasStats) => void
   onCellFilled: (cellIndex: number, colorId: number, source: FillSource) => void
+  onProgressChange: (progress: ArtworkProgressSnapshot) => void
 }
 
 interface ActivePointer extends Point {
@@ -73,14 +77,17 @@ export const ColorCanvas = forwardRef<ColorCanvasHandle, ColorCanvasProps>(funct
   resetProgressNonce,
   interactionLocked,
   cleanReveal,
+  initialProgress,
   onStatsChange,
   onCellFilled,
+  onProgressChange,
 }, forwardedRef) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const filledRef = useRef<Set<number>>(new Set())
   const selectedColorRef = useRef(selectedColor)
   const onStatsChangeRef = useRef(onStatsChange)
   const onCellFilledRef = useRef(onCellFilled)
+  const onProgressChangeRef = useRef(onProgressChange)
   const interactionLockedRef = useRef(interactionLocked)
   const cleanRevealRef = useRef(cleanReveal)
   const viewRef = useRef<ViewTransform>({ scale: 20, offsetX: 0, offsetY: 0 })
@@ -104,6 +111,7 @@ export const ColorCanvas = forwardRef<ColorCanvasHandle, ColorCanvasProps>(funct
   selectedColorRef.current = selectedColor
   onStatsChangeRef.current = onStatsChange
   onCellFilledRef.current = onCellFilled
+  onProgressChangeRef.current = onProgressChange
   interactionLockedRef.current = interactionLocked
   cleanRevealRef.current = cleanReveal
 
@@ -121,6 +129,10 @@ export const ColorCanvas = forwardRef<ColorCanvasHandle, ColorCanvasProps>(funct
       filled: filledRef.current.size,
       total: artwork.cells.filter((color) => color !== 0).length,
       completedColors: progress.filter((color) => color.complete).map((color) => color.colorId),
+    })
+    onProgressChangeRef.current({
+      filled: [...filledRef.current],
+      fillOrder: [...fillOrderRef.current],
     })
   }
 
@@ -393,6 +405,10 @@ export const ColorCanvas = forwardRef<ColorCanvasHandle, ColorCanvasProps>(funct
       }, 720)
       return true
     },
+    getProgress: () => ({
+      filled: [...filledRef.current],
+      fillOrder: [...fillOrderRef.current],
+    }),
     isComplete: () => filledRef.current.size === artwork.cells.filter((color) => color !== 0).length,
     replayCompletion: () => {
       if (replayFrameRef.current !== null) window.cancelAnimationFrame(replayFrameRef.current)
@@ -536,9 +552,18 @@ export const ColorCanvas = forwardRef<ColorCanvasHandle, ColorCanvasProps>(funct
   }, [resetViewNonce])
 
   useEffect(() => {
-    filledRef.current.clear()
+    const validFilled = initialProgress.filled.filter((index) => (
+      Number.isInteger(index) && artwork.cells[index] !== undefined && artwork.cells[index] !== 0
+    ))
+    const filled = new Set(validFilled)
+    const ordered = initialProgress.fillOrder.filter((index) => filled.has(index))
+    const orderedSet = new Set(ordered)
+    filled.forEach((index) => {
+      if (!orderedSet.has(index)) ordered.push(index)
+    })
+    filledRef.current = filled
     strokeAddedRef.current = []
-    fillOrderRef.current = []
+    fillOrderRef.current = ordered
     hintFlashIndexRef.current = null
     if (replayFrameRef.current !== null) {
       window.cancelAnimationFrame(replayFrameRef.current)
