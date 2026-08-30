@@ -1,11 +1,13 @@
 import {
+  forwardRef,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useRef,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import type { Artwork } from '../game/artwork'
-import { canFillCell, getColorProgress } from '../game/rules'
+import { canFillCell, findHintCell, getColorProgress } from '../game/rules'
 import {
   cellsOnLine,
   clamp,
@@ -22,12 +24,23 @@ export interface CanvasStats {
   completedColors: number[]
 }
 
+export type FillSource = 'paint' | 'hint'
+
+export interface ColorCanvasHandle {
+  fillHint: () => boolean
+  isComplete: () => boolean
+  replayCompletion: () => Promise<void>
+}
+
 interface ColorCanvasProps {
   artwork: Artwork
   selectedColor: number
   resetViewNonce: number
   resetProgressNonce: number
+  interactionLocked: boolean
+  cleanReveal: boolean
   onStatsChange: (stats: CanvasStats) => void
+  onCellFilled: (cellIndex: number, colorId: number, source: FillSource) => void
 }
 
 interface ActivePointer extends Point {
@@ -53,17 +66,23 @@ function pointerCenter(a: Point, b: Point): Point {
   return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
 }
 
-export function ColorCanvas({
+export const ColorCanvas = forwardRef<ColorCanvasHandle, ColorCanvasProps>(function ColorCanvas({
   artwork,
   selectedColor,
   resetViewNonce,
   resetProgressNonce,
+  interactionLocked,
+  cleanReveal,
   onStatsChange,
-}: ColorCanvasProps) {
+  onCellFilled,
+}, forwardedRef) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const filledRef = useRef<Set<number>>(new Set())
   const selectedColorRef = useRef(selectedColor)
   const onStatsChangeRef = useRef(onStatsChange)
+  const onCellFilledRef = useRef(onCellFilled)
+  const interactionLockedRef = useRef(interactionLocked)
+  const cleanRevealRef = useRef(cleanReveal)
   const viewRef = useRef<ViewTransform>({ scale: 20, offsetX: 0, offsetY: 0 })
   const fitScaleRef = useRef(20)
   const canvasSizeRef = useRef({ width: 0, height: 0 })
@@ -75,12 +94,18 @@ export function ColorCanvas({
   const pendingTimerRef = useRef<number | null>(null)
   const transformRef = useRef<TransformGesture | null>(null)
   const strokeAddedRef = useRef<number[]>([])
+  const fillOrderRef = useRef<number[]>([])
+  const hintFlashIndexRef = useRef<number | null>(null)
+  const replayFrameRef = useRef<number | null>(null)
   const loupePointRef = useRef<Point | null>(null)
   const drawRef = useRef<() => void>(() => undefined)
   const frameRef = useRef<number | null>(null)
 
   selectedColorRef.current = selectedColor
   onStatsChangeRef.current = onStatsChange
+  onCellFilledRef.current = onCellFilled
+  interactionLockedRef.current = interactionLocked
+  cleanRevealRef.current = cleanReveal
 
   const invalidate = () => {
     if (frameRef.current !== null) return
@@ -151,9 +176,11 @@ export function ColorCanvas({
           ? color.softColor
           : '#fffdfd'
       context.fillRect(x, y, view.scale, view.scale)
-      context.strokeStyle = filled ? 'rgba(78, 57, 79, 0.16)' : 'rgba(112, 89, 112, 0.24)'
-      context.lineWidth = clamp(view.scale * 0.035, 0.7, 1.25)
-      context.strokeRect(x, y, view.scale, view.scale)
+      if (!(cleanRevealRef.current && filled)) {
+        context.strokeStyle = filled ? 'rgba(78, 57, 79, 0.16)' : 'rgba(112, 89, 112, 0.24)'
+        context.lineWidth = clamp(view.scale * 0.035, 0.7, 1.25)
+        context.strokeRect(x, y, view.scale, view.scale)
+      }
 
       if (!filled && showNumbers) {
         context.fillStyle = requiredColor === selectedColorRef.current ? '#513d52' : '#8c7a8d'
@@ -188,6 +215,23 @@ export function ColorCanvas({
     context.fillRect(boardX, boardY, boardWidth, boardHeight)
     context.restore()
     drawCells(context, view, true)
+
+    const hintIndex = hintFlashIndexRef.current
+    if (hintIndex !== null) {
+      const hintRow = Math.floor(hintIndex / artwork.width)
+      const hintCol = hintIndex % artwork.width
+      const centerX = view.offsetX + (hintCol + 0.5) * view.scale
+      const centerY = view.offsetY + (hintRow + 0.5) * view.scale
+      context.save()
+      context.beginPath()
+      context.arc(centerX, centerY, Math.max(13, view.scale * 0.72), 0, Math.PI * 2)
+      context.strokeStyle = '#ffd166'
+      context.lineWidth = 5
+      context.shadowColor = 'rgba(255, 188, 61, 0.75)'
+      context.shadowBlur = 14
+      context.stroke()
+      context.restore()
+    }
 
     const contact = loupePointRef.current
     if (!contact) return
@@ -244,6 +288,15 @@ export function ColorCanvas({
     return { x: event.clientX - bounds.left, y: event.clientY - bounds.top }
   }
 
+  const fillCell = (index: number, source: FillSource): boolean => {
+    if (!canFillCell(artwork, index, selectedColorRef.current, filledRef.current)) return false
+    filledRef.current.add(index)
+    fillOrderRef.current.push(index)
+    if (source === 'paint') strokeAddedRef.current.push(index)
+    onCellFilledRef.current(index, selectedColorRef.current, source)
+    return true
+  }
+
   const fillAtPoint = (point: Point) => {
     const cell = screenToCell(point, viewRef.current, artwork.width, artwork.height)
     loupePointRef.current = point
@@ -257,10 +310,7 @@ export function ColorCanvas({
     let changed = false
     path.forEach(({ col, row }) => {
       const index = row * artwork.width + col
-      if (!canFillCell(artwork, index, selectedColorRef.current, filledRef.current)) return
-      filledRef.current.add(index)
-      strokeAddedRef.current.push(index)
-      changed = true
+      if (fillCell(index, 'paint')) changed = true
     })
     lastPaintCellRef.current = cell
     if (changed) reportStats()
@@ -280,7 +330,9 @@ export function ColorCanvas({
 
   const rollbackActiveStroke = () => {
     if (strokeAddedRef.current.length === 0) return
+    const rolledBack = new Set(strokeAddedRef.current)
     strokeAddedRef.current.forEach((index) => filledRef.current.delete(index))
+    fillOrderRef.current = fillOrderRef.current.filter((index) => !rolledBack.has(index))
     strokeAddedRef.current = []
     reportStats()
   }
@@ -325,6 +377,57 @@ export function ColorCanvas({
     invalidate()
   }
 
+  useImperativeHandle(forwardedRef, () => ({
+    fillHint: () => {
+      if (interactionLockedRef.current) return false
+      const index = findHintCell(artwork, selectedColorRef.current, filledRef.current)
+      if (index === null || !fillCell(index, 'hint')) return false
+      hintFlashIndexRef.current = index
+      reportStats()
+      invalidate()
+      window.setTimeout(() => {
+        if (hintFlashIndexRef.current === index) {
+          hintFlashIndexRef.current = null
+          invalidate()
+        }
+      }, 720)
+      return true
+    },
+    isComplete: () => filledRef.current.size === artwork.cells.filter((color) => color !== 0).length,
+    replayCompletion: () => {
+      if (replayFrameRef.current !== null) window.cancelAnimationFrame(replayFrameRef.current)
+      const order = [...fillOrderRef.current]
+      const finalFilled = new Set(filledRef.current)
+      const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+      const duration = reducedMotion ? 450 : clamp(order.length * 14, 2800, 5200)
+      filledRef.current.clear()
+      hintFlashIndexRef.current = null
+      invalidate()
+
+      return new Promise<void>((resolve) => {
+        const start = performance.now()
+        const step = (now: number) => {
+          const progress = clamp((now - start) / duration, 0, 1)
+          const eased = 1 - Math.pow(1 - progress, 3)
+          const targetCount = Math.min(order.length, Math.ceil(eased * order.length))
+          for (let index = filledRef.current.size; index < targetCount; index += 1) {
+            filledRef.current.add(order[index])
+          }
+          invalidate()
+          if (progress < 1) {
+            replayFrameRef.current = window.requestAnimationFrame(step)
+            return
+          }
+          replayFrameRef.current = null
+          filledRef.current = finalFilled
+          invalidate()
+          resolve()
+        }
+        replayFrameRef.current = window.requestAnimationFrame(step)
+      })
+    },
+  }), [artwork])
+
   const finishPointer = (event: ReactPointerEvent<HTMLCanvasElement>, cancelled: boolean) => {
     event.preventDefault()
     if (ignoredPointersRef.current.delete(event.pointerId)) return
@@ -360,6 +463,7 @@ export function ColorCanvas({
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     event.preventDefault()
+    if (interactionLockedRef.current) return
     event.currentTarget.setPointerCapture(event.pointerId)
     const point = pointForEvent(event)
 
@@ -434,18 +538,25 @@ export function ColorCanvas({
   useEffect(() => {
     filledRef.current.clear()
     strokeAddedRef.current = []
+    fillOrderRef.current = []
+    hintFlashIndexRef.current = null
+    if (replayFrameRef.current !== null) {
+      window.cancelAnimationFrame(replayFrameRef.current)
+      replayFrameRef.current = null
+    }
     reportStats()
     invalidate()
   }, [resetProgressNonce, artwork])
 
   useEffect(() => {
     invalidate()
-  }, [selectedColor])
+  }, [selectedColor, cleanReveal])
 
   useEffect(
     () => () => {
       clearPendingTimer()
       if (frameRef.current !== null) window.cancelAnimationFrame(frameRef.current)
+      if (replayFrameRef.current !== null) window.cancelAnimationFrame(replayFrameRef.current)
     },
     [],
   )
@@ -462,5 +573,4 @@ export function ColorCanvas({
       onPointerCancel={(event) => finishPointer(event, true)}
     />
   )
-}
-
+})

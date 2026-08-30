@@ -14,6 +14,17 @@ export function canFillCell(
   )
 }
 
+export function findHintCell(
+  artwork: Artwork,
+  selectedColor: number,
+  filled: ReadonlySet<number>,
+): number | null {
+  const index = artwork.cells.findIndex(
+    (requiredColor, cellIndex) => requiredColor === selectedColor && !filled.has(cellIndex),
+  )
+  return index === -1 ? null : index
+}
+
 export interface ColorProgress {
   colorId: number
   filled: number
@@ -33,4 +44,3 @@ export function getColorProgress(artwork: Artwork, filled: ReadonlySet<number>):
     return { colorId: id, filled: completed, total, complete: total > 0 && completed === total }
   })
 }
-
